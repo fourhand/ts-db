@@ -37,6 +37,21 @@ fn valuefile_multiple_blocks() {
 }
 
 #[test]
+fn valuefile_flush_after_idle() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("flush.dat");
+    {
+        let mut vf = valuefile::ValueFile::with_size(&path, valueblock::BLOCK_BYTES).unwrap();
+        vf.write_value(0, 0, 1234).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        vf.flush_if_idle().unwrap();
+    }
+
+    let vf = valuefile::ValueFile::with_size(&path, valueblock::BLOCK_BYTES).unwrap();
+    assert_eq!(vf.read_value(0, 0).unwrap(), 1234);
+}
+
+#[test]
 fn it_works() {
     let result = add(2, 2);
     assert_eq!(result, 4);

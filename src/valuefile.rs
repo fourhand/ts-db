@@ -18,7 +18,7 @@ pub struct ValueFile {
 impl ValueFile {
     pub fn with_size<P: AsRef<Path>>(path: P, size: usize) -> Result<Self> {
         let path_ref = path.as_ref();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -32,6 +32,10 @@ impl ValueFile {
             last_write: Instant::now(),
             size,
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn get_block(&mut self, index: usize) -> Option<ValueBlock<'_>> {
