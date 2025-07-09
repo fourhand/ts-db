@@ -1,0 +1,20 @@
+[package]
+name = "tsdb"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A high-performance time series database with mmap-based I/O and parallel processing support"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+rayon = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+tempfile = "3.8"
+
+[dev-dependencies]
