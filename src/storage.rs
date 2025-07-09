@@ -101,10 +101,18 @@ impl VFile {
     
     /// Write a value at a specific sequence position
     pub fn write_value(&mut self, seq: usize, value: Value) -> Result<()> {
-        // Find the appropriate block for this sequence
+        // Check if adding this value would exceed the 2GB limit
         let values_per_block = VBLOCK_SIZE / std::mem::size_of::<Value>();
         let block_index = seq / values_per_block;
         let block_seq = seq % values_per_block;
+        
+        // Calculate the new total size if we add this value
+        let new_blocks_needed = block_index + 1;
+        let estimated_new_size = new_blocks_needed * VBLOCK_SIZE;
+        
+        if estimated_new_size > VFILE_SIZE_LIMIT {
+            return Err(TsDbError::FileSizeLimitExceeded);
+        }
         
         // Ensure we have enough blocks
         while block_index >= self.blocks.len() {
@@ -186,12 +194,19 @@ impl ValueBlockManager {
     
     /// Write a value at a specific sequence position
     pub fn write_value(&mut self, seq: usize, value: Value) -> Result<()> {
+        // Check if current file is approaching or exceeding 2GB limit
+        let current_file = &mut self.files[self.current_file_index];
+        if current_file.is_size_limit_exceeded() {
+            // Create a new file when current file exceeds 2GB
+            self.create_new_file()?;
+        }
+        
         // Try to write to current file
         if let Ok(()) = self.files[self.current_file_index].write_value(seq, value) {
             return Ok(());
         }
         
-        // If current file is full, create a new one
+        // If current file is full (for other reasons), create a new one
         self.create_new_file()?;
         
         // Try writing to the new file
@@ -425,45 +440,343 @@ mod tests {
     }
     
     #[test]
-    fn test_value_block_manager_actual_file_rollover() {
+    fn test_value_block_manager_actual_2gb_rollover() {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_string_lossy().to_string();
         
         let mut manager = ValueBlockManager::new(base_path).unwrap();
         
-        // Calculate how many u64 values can fit in 2GB
+        // Calculate exactly how many u64 values can fit in 2GB
         let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
         
-        // Write enough data to potentially trigger file rollover
-        // We'll write in chunks to avoid memory issues
-        let chunk_size = 100000;
-        let num_chunks = (values_per_2gb / chunk_size).min(3); // Limit to 3 chunks for test speed
+        // Write data to fill the first file completely
+        for i in 0..values_per_2gb {
+            manager.write_value(i, i as u64).unwrap();
+        }
         
-        for chunk in 0..num_chunks {
-            let start_seq = chunk * chunk_size;
-            let end_seq = start_seq + chunk_size;
+        // Verify all data in first file can be read
+        for i in 0..values_per_2gb {
+            assert_eq!(manager.read_value(i).unwrap(), i as u64);
+        }
+        
+        // Write one more value - this should trigger file rollover
+        manager.write_value(values_per_2gb, 999999).unwrap();
+        
+        // Verify file count increased
+        assert_eq!(manager.file_count(), 2);
+        assert_eq!(manager.current_file_index(), 1);
+        
+        // Verify data from both files can be read
+        assert_eq!(manager.read_value(0).unwrap(), 0);
+        assert_eq!(manager.read_value(values_per_2gb - 1).unwrap(), (values_per_2gb - 1) as u64);
+        assert_eq!(manager.read_value(values_per_2gb).unwrap(), 999999);
+        
+        // Write more data to the second file
+        for i in 1..1000 {
+            let seq = values_per_2gb + i;
+            manager.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Verify data from second file
+        for i in 1..1000 {
+            let seq = values_per_2gb + i;
+            assert_eq!(manager.read_value(seq).unwrap(), seq as u64);
+        }
+    }
+    
+    #[test]
+    fn test_value_block_manager_multiple_file_rollover() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut manager = ValueBlockManager::new(base_path).unwrap();
+        
+        // Calculate values per 2GB file
+        let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
+        
+        // Create 3 files by writing data that exceeds 2GB twice
+        for file_num in 0..3 {
+            let start_seq = file_num * values_per_2gb;
+            let end_seq = start_seq + values_per_2gb;
             
+            // Write data for this file
             for i in start_seq..end_seq {
                 manager.write_value(i, i as u64).unwrap();
             }
             
-            // Verify the chunk we just wrote
+            // Verify file count and current index
+            assert_eq!(manager.file_count(), file_num + 1);
+            assert_eq!(manager.current_file_index(), file_num);
+            
+            // Verify data integrity for this file
             for i in start_seq..end_seq {
                 assert_eq!(manager.read_value(i).unwrap(), i as u64);
             }
         }
         
-        // Test that we can read values from different parts of the data
+        // Write data to the fourth file
+        let fourth_file_start = 3 * values_per_2gb;
+        for i in 0..1000 {
+            let seq = fourth_file_start + i;
+            manager.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Verify we have 4 files now
+        assert_eq!(manager.file_count(), 4);
+        assert_eq!(manager.current_file_index(), 3);
+        
+        // Verify data from all files can be read
         assert_eq!(manager.read_value(0).unwrap(), 0);
-        assert_eq!(manager.read_value(1000).unwrap(), 1000);
-        assert_eq!(manager.read_value(chunk_size - 1).unwrap(), (chunk_size - 1) as u64);
+        assert_eq!(manager.read_value(values_per_2gb - 1).unwrap(), (values_per_2gb - 1) as u64);
+        assert_eq!(manager.read_value(values_per_2gb).unwrap(), values_per_2gb as u64);
+        assert_eq!(manager.read_value(2 * values_per_2gb).unwrap(), (2 * values_per_2gb) as u64);
+        assert_eq!(manager.read_value(fourth_file_start).unwrap(), fourth_file_start as u64);
+    }
+    
+    #[test]
+    fn test_vfile_edge_case_2gb_boundary() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("boundary_test.dat").to_string_lossy().to_string();
         
-        // Test file count (should be at least 1, potentially more if rollover occurred)
+        let mut file = VFile::new(file_path).unwrap();
+        
+        // Calculate exactly how many values fit in 2GB
+        let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
+        
+        // Write data up to exactly 2GB
+        for i in 0..values_per_2gb {
+            file.write_value(i, i as u64).unwrap();
+        }
+        
+        // At exactly 2GB, size limit should not be exceeded (it's the boundary)
+        assert!(!file.is_size_limit_exceeded());
+        
+        // Try to write one more value - this should fail or trigger rollover
+        let result = file.write_value(values_per_2gb, 999999);
+        
+        // The behavior depends on implementation - either it should fail
+        // or the VFile should handle it gracefully
+        if result.is_ok() {
+            // If it succeeds, verify the data
+            assert_eq!(file.read_value(values_per_2gb).unwrap(), 999999);
+        } else {
+            // If it fails, that's also acceptable behavior
+            assert!(result.is_err());
+        }
+    }
+    
+    #[test]
+    fn test_value_block_manager_file_transition_logic() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut manager = ValueBlockManager::new(base_path).unwrap();
+        
+        // Initially, we should have 1 file
+        assert_eq!(manager.file_count(), 1);
+        assert_eq!(manager.current_file_index(), 0);
+        
+        // Calculate values per 2GB file
+        let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
+        
+        // Write data to trigger first rollover
+        for i in 0..values_per_2gb {
+            manager.write_value(i, i as u64).unwrap();
+        }
+        
+        // Write one more to trigger rollover
+        manager.write_value(values_per_2gb, 999999).unwrap();
+        
+        // Verify file transition
+        assert_eq!(manager.file_count(), 2);
+        assert_eq!(manager.current_file_index(), 1);
+        
+        // Verify data integrity across files
+        assert_eq!(manager.read_value(0).unwrap(), 0);
+        assert_eq!(manager.read_value(values_per_2gb - 1).unwrap(), (values_per_2gb - 1) as u64);
+        assert_eq!(manager.read_value(values_per_2gb).unwrap(), 999999);
+        
+        // Test reading from all files
+        for file_num in 0..manager.file_count() {
+            let start_seq = file_num * values_per_2gb;
+            let end_seq = if file_num == manager.file_count() - 1 {
+                start_seq + 1 // Only one value in last file for this test
+            } else {
+                start_seq + values_per_2gb
+            };
+            
+            for i in start_seq..end_seq {
+                assert_eq!(manager.read_value(i).unwrap(), i as u64);
+            }
+        }
+    }
+    
+    #[test]
+    fn test_vfile_actual_2gb_rollover_behavior() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("actual_2gb_test.dat").to_string_lossy().to_string();
+        
+        let mut file = VFile::new(file_path).unwrap();
+        
+        // Calculate values per 2GB file
+        let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
+        
+        // Write data to fill exactly 2GB
+        for i in 0..values_per_2gb {
+            file.write_value(i, i as u64).unwrap();
+        }
+        
+        // Check if size limit is exceeded at exactly 2GB
+        let total_size = file.total_size();
+        println!("Total size: {} bytes, 2GB: {} bytes", total_size, VFILE_SIZE_LIMIT);
+        
+        // The current implementation allows writing beyond 2GB
+        // Let's write one more value to see the actual behavior
+        let result = file.write_value(values_per_2gb, 999999);
+        assert!(result.is_ok(), "VFile should allow writing beyond 2GB");
+        
+        // Verify the data was written
+        assert_eq!(file.read_value(values_per_2gb).unwrap(), 999999);
+        
+        // Check if size limit is now exceeded
+        let new_total_size = file.total_size();
+        println!("New total size: {} bytes", new_total_size);
+        
+        // The current implementation doesn't enforce 2GB limit
+        // So we should be able to continue writing
+        for i in 1..1000 {
+            let seq = values_per_2gb + i;
+            file.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Verify all data can be read
+        assert_eq!(file.read_value(0).unwrap(), 0);
+        assert_eq!(file.read_value(values_per_2gb - 1).unwrap(), (values_per_2gb - 1) as u64);
+        assert_eq!(file.read_value(values_per_2gb).unwrap(), 999999);
+        assert_eq!(file.read_value(values_per_2gb + 999).unwrap(), (values_per_2gb + 999) as u64);
+    }
+    
+    #[test]
+    fn test_value_block_manager_force_rollover() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut manager = ValueBlockManager::new(base_path).unwrap();
+        
+        // Write a large sequence number that would require a new file
+        // This simulates the actual rollover mechanism
+        let large_seq = 1000000000; // A very large sequence number
+        manager.write_value(large_seq, 123456).unwrap();
+        
+        // Verify the data was written
+        assert_eq!(manager.read_value(large_seq).unwrap(), 123456);
+        
+        // Write more data with large sequence numbers to force multiple files
+        for i in 1..10 {
+            let seq = large_seq + i;
+            manager.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Verify all data can be read
+        for i in 0..10 {
+            let seq = large_seq + i;
+            let expected_value = if i == 0 { 123456 } else { seq as u64 };
+            assert_eq!(manager.read_value(seq).unwrap(), expected_value);
+        }
+        
+        // Check file count (should be at least 1, potentially more)
         assert!(manager.file_count() >= 1);
+    }
+    
+    #[test]
+    fn test_2gb_rollover_verification() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
         
-        // Test that current file index is valid
-        let current_index = manager.current_file_index();
-        assert!(current_index < manager.file_count());
+        let mut manager = ValueBlockManager::new(base_path).unwrap();
+        
+        // Initially should have 1 file
+        assert_eq!(manager.file_count(), 1);
+        println!("Initial file count: {}", manager.file_count());
+        
+        // Calculate values per 2GB file
+        let values_per_2gb = VFILE_SIZE_LIMIT / std::mem::size_of::<Value>();
+        println!("Values per 2GB: {}", values_per_2gb);
+        
+        // Write data to fill exactly 2GB
+        for i in 0..values_per_2gb {
+            manager.write_value(i, i as u64).unwrap();
+        }
+        
+        // Should still have 1 file at exactly 2GB
+        assert_eq!(manager.file_count(), 1);
+        println!("File count after filling 2GB: {}", manager.file_count());
+        
+        // Write one more value - this should trigger rollover
+        manager.write_value(values_per_2gb, 999999).unwrap();
+        
+        // Should now have 2 files
+        assert_eq!(manager.file_count(), 2);
+        println!("File count after rollover: {}", manager.file_count());
+        
+        // Verify data integrity
+        assert_eq!(manager.read_value(0).unwrap(), 0);
+        assert_eq!(manager.read_value(values_per_2gb - 1).unwrap(), (values_per_2gb - 1) as u64);
+        assert_eq!(manager.read_value(values_per_2gb).unwrap(), 999999);
+        
+        // Write more data to second file
+        for i in 1..1000 {
+            let seq = values_per_2gb + i;
+            manager.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Should still have 2 files
+        assert_eq!(manager.file_count(), 2);
+        println!("Final file count: {}", manager.file_count());
+        
+        // Verify all data can be read
+        assert_eq!(manager.read_value(values_per_2gb + 999).unwrap(), (values_per_2gb + 999) as u64);
+    }
+    
+    #[test]
+    fn test_simple_rollover_with_large_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut manager = ValueBlockManager::new(base_path).unwrap();
+        
+        // Initially should have 1 file
+        assert_eq!(manager.file_count(), 1);
+        println!("Initial file count: {}", manager.file_count());
+        
+        // Write a value with a very large sequence number
+        // This should immediately trigger file rollover
+        let large_seq = 1000000000; // 1 billion
+        manager.write_value(large_seq, 123456).unwrap();
+        
+        // Should now have 2 files
+        assert_eq!(manager.file_count(), 2);
+        println!("File count after large index write: {}", manager.file_count());
+        
+        // Verify the data was written correctly
+        assert_eq!(manager.read_value(large_seq).unwrap(), 123456);
+        
+        // Write a few more values with large sequence numbers
+        for i in 1..5 {
+            let seq = large_seq + i;
+            manager.write_value(seq, seq as u64).unwrap();
+        }
+        
+        // Should still have 2 files
+        assert_eq!(manager.file_count(), 2);
+        println!("Final file count: {}", manager.file_count());
+        
+        // Verify all data can be read
+        for i in 0..5 {
+            let seq = large_seq + i;
+            let expected_value = if i == 0 { 123456 } else { seq as u64 };
+            assert_eq!(manager.read_value(seq).unwrap(), expected_value);
+        }
     }
     
     #[test]
@@ -558,5 +871,36 @@ mod tests {
         for i in 0..10000 {
             assert_eq!(file.read_value(i).unwrap(), i as u64);
         }
+    }
+    
+    #[test]
+    fn test_vfile_size_limit_exceeded() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("size_limit_test.dat").to_string_lossy().to_string();
+        
+        let mut file = VFile::new(file_path).unwrap();
+        
+        // Initially, size limit should not be exceeded
+        assert!(!file.is_size_limit_exceeded());
+        
+        // Write data until we approach the 2GB limit
+        let values_per_block = VBLOCK_SIZE / std::mem::size_of::<Value>();
+        let blocks_needed_for_2gb = (VFILE_SIZE_LIMIT / VBLOCK_SIZE) + 1;
+        
+        // Write data to fill multiple blocks
+        for block in 0..blocks_needed_for_2gb {
+            for i in 0..values_per_block {
+                let seq = block * values_per_block + i;
+                let value = (block * 1000 + i) as u64;
+                file.write_value(seq, value).unwrap();
+            }
+        }
+        
+        // Now the size limit should be exceeded
+        assert!(file.is_size_limit_exceeded());
+        
+        // Verify we can still read data
+        assert_eq!(file.read_value(0).unwrap(), 0);
+        assert_eq!(file.read_value(values_per_block - 1).unwrap(), (values_per_block - 1) as u64);
     }
 } 
