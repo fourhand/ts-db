@@ -200,4 +200,191 @@ mod tests {
         assert_eq!(sum[0], 223); // key1 sum
         assert_eq!(sum[1], 456); // key2 sum
     }
+    
+    #[test]
+    fn test_segment_large_key_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("large_keys".to_string(), base_path, 60).unwrap();
+        
+        // Insert many keys to test keymap scaling
+        let num_keys = 10000;
+        for i in 0..num_keys {
+            let key = format!("key_{}", i);
+            segment.insert(1640995200, &key, i as u64).unwrap();
+        }
+        
+        // Verify all keys can be retrieved
+        for i in 0..num_keys {
+            let key = format!("key_{}", i);
+            assert_eq!(segment.get_key_at(1640995200, &key).unwrap(), i as u64);
+        }
+        
+        // Test that keymap size is correct
+        assert_eq!(segment.keymap_len(), num_keys);
+        
+        // Test aggregation with many keys
+        let unique = segment.aggr_unique(1640995200, 1640995200).unwrap();
+        assert_eq!(unique.len(), num_keys);
+        
+        // Count how many keys have values > 0
+        let active_keys = unique.iter().filter(|&&x| x > 0).count();
+        assert_eq!(active_keys, num_keys);
+    }
+    
+    #[test]
+    fn test_segment_multiple_bucket_times() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("multi_time".to_string(), base_path, 60).unwrap();
+        
+        // Insert data across multiple bucket times
+        let bucket_times = vec![1640995200, 1640995260, 1640995320, 1640995380];
+        let keys = vec!["key1", "key2", "key3"];
+        
+        for (i, &bucket_time) in bucket_times.iter().enumerate() {
+            for (j, &key) in keys.iter().enumerate() {
+                let value = (i * 100) + j;
+                segment.insert(bucket_time, key, value as u64).unwrap();
+            }
+        }
+        
+        // Verify data for each bucket time
+        for (i, &bucket_time) in bucket_times.iter().enumerate() {
+            let values = segment.get_all_at(bucket_time).unwrap();
+            for (j, &key) in keys.iter().enumerate() {
+                let expected_value = (i * 100) + j;
+                assert_eq!(segment.get_key_at(bucket_time, key).unwrap(), expected_value as u64);
+            }
+        }
+        
+        // Test aggregation across multiple bucket times
+        let unique = segment.aggr_unique(1640995200, 1640995380).unwrap();
+        let sum = segment.aggr_sum(1640995200, 1640995380).unwrap();
+        
+        // All keys should be present across the time range
+        assert_eq!(unique.iter().filter(|&&x| x > 0).count(), keys.len());
+        
+        // Sum should be the sum of all values across all bucket times
+        let expected_sum: u64 = bucket_times.iter().enumerate()
+            .map(|(i, _)| keys.iter().enumerate()
+                .map(|(j, _)| (i * 100 + j) as u64)
+                .sum::<u64>())
+            .sum();
+        
+        let actual_sum: u64 = sum.iter().sum();
+        assert_eq!(actual_sum, expected_sum);
+    }
+    
+    #[test]
+    fn test_segment_accumulate_overflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("accumulate_test".to_string(), base_path, 60).unwrap();
+        
+        // Test accumulate with large values
+        let large_value = u64::MAX / 2;
+        
+        segment.insert(1640995200, "key1", large_value).unwrap();
+        segment.accumulate(1640995200, "key1", large_value).unwrap();
+        
+        // Should handle overflow gracefully (wraps around)
+        let result = segment.get_key_at(1640995200, "key1").unwrap();
+        assert_eq!(result, large_value.wrapping_add(large_value));
+        
+        // Test multiple accumulates
+        for i in 0..10 {
+            segment.accumulate(1640995200, "key2", i as u64).unwrap();
+        }
+        
+        // Expected sum: 0 + 1 + 2 + ... + 9 = 45
+        let expected_sum = (0..10).sum::<u64>();
+        assert_eq!(segment.get_key_at(1640995200, "key2").unwrap(), expected_sum);
+    }
+    
+    #[test]
+    fn test_segment_edge_cases() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("edge_cases".to_string(), base_path, 60).unwrap();
+        
+        // Test with zero values
+        segment.insert(1640995200, "zero_key", 0).unwrap();
+        assert_eq!(segment.get_key_at(1640995200, "zero_key").unwrap(), 0);
+        
+        // Test with maximum u64 value
+        segment.insert(1640995200, "max_key", u64::MAX).unwrap();
+        assert_eq!(segment.get_key_at(1640995200, "max_key").unwrap(), u64::MAX);
+        
+        // Test with very long key names
+        let long_key = "a".repeat(1000);
+        segment.insert(1640995200, &long_key, 999).unwrap();
+        assert_eq!(segment.get_key_at(1640995200, &long_key).unwrap(), 999);
+        
+        // Test with special characters in key names
+        let special_key = "key@#$%^&*()_+-=[]{}|;':\",./<>?";
+        segment.insert(1640995200, special_key, 888).unwrap();
+        assert_eq!(segment.get_key_at(1640995200, special_key).unwrap(), 888);
+    }
+    
+    #[test]
+    fn test_segment_concurrent_access_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("concurrent".to_string(), base_path, 60).unwrap();
+        
+        // Simulate concurrent-like access patterns
+        let patterns = vec![
+            (0, "key1", 100),
+            (1000, "key2", 200),
+            (10000, "key3", 300),
+            (100000, "key4", 400),
+        ];
+        
+        // Insert in scattered pattern
+        for (seq, key, value) in &patterns {
+            segment.insert(1640995200, key, *value).unwrap();
+        }
+        
+        // Verify all values
+        for (seq, key, expected_value) in &patterns {
+            assert_eq!(segment.get_key_at(1640995200, key).unwrap(), *expected_value);
+        }
+        
+        // Test aggregation with scattered data
+        let unique = segment.aggr_unique(1640995200, 1640995200).unwrap();
+        let active_keys = unique.iter().filter(|&&x| x > 0).count();
+        assert_eq!(active_keys, patterns.len());
+    }
+    
+    #[test]
+    fn test_segment_flush_operations() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_string_lossy().to_string();
+        
+        let mut segment = Segment::new("flush_test".to_string(), base_path, 60).unwrap();
+        
+        // Insert some data
+        segment.insert(1640995200, "key1", 123).unwrap();
+        segment.insert(1640995200, "key2", 456).unwrap();
+        segment.accumulate(1640995200, "key3", 789).unwrap();
+        
+        // Test flush
+        segment.flush().unwrap();
+        
+        // Verify data integrity after flush
+        assert_eq!(segment.get_key_at(1640995200, "key1").unwrap(), 123);
+        assert_eq!(segment.get_key_at(1640995200, "key2").unwrap(), 456);
+        assert_eq!(segment.get_key_at(1640995200, "key3").unwrap(), 789);
+        
+        // Test aggregation after flush
+        let unique = segment.aggr_unique(1640995200, 1640995200).unwrap();
+        let active_keys = unique.iter().filter(|&&x| x > 0).count();
+        assert_eq!(active_keys, 3);
+    }
 } 
